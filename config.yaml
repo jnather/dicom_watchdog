@@ -1,0 +1,45 @@
+paths:
+  # Folder to watch for incoming ZIP files
+  watch_dir: "/mnt/e/programacao_novo/python/Laudos_Matao/watchdog_dicom_upload/incoming"
+  # Temporary workspace where ZIPs are extracted
+  work_dir: "/mnt/e/programacao_novo/python/Laudos_Matao/watchdog_dicom_upload/work"
+  # Where processed ZIPs are moved (if enabled)
+  archive_dir: "/mnt/e/programacao_novo/python/Laudos_Matao/watchdog_dicom_upload/archive"
+  # SQLite file used to remember which ZIPs were processed (by hash)
+  state_db: "/mnt/e/programacao_novo/python/Laudos_Matao/watchdog_dicom_upload/state/processed.sqlite3"
+
+dicom:
+  # Local AE (your client)
+  local_ae_title: "HAL9000_6"
+  # Local port to bind to (Orthanc requires known source port)
+  local_port: 4011
+  # Remote peer (Orthanc server)
+  peer_host: "192.168.1.15"
+  peer_port: 4242
+  peer_ae_title: "ORTHANC"
+  # Max PDU (optional; default pynetdicom). Example: 131072
+  max_pdu: 131072
+  # TLS not configured in this example; set true and extend if needed
+  use_tls: false
+
+behavior:
+  # Deduplication policy for uploaded objects
+  # Options: uid_then_sha256 | sha256_only | uid_only
+  dedup_policy: "uid_then_sha256"
+  # Interval (seconds) for polling fallback if watchdog is unavailable
+  poll_interval_seconds: 10
+  # Wait this many seconds to ensure ZIP is fully written (stable size)
+  wait_zip_complete_seconds: 10
+  # Send C-STORE in batches of N files per association
+  send_batch_size: 128
+  # Delete extracted temp tree after upload
+  delete_extracted_after_upload: true
+  # Move ZIP to archive after processing
+  move_zip_to_archive: true
+  # Force polling watchdog for network drives/WSL mounts (more reliable)
+  watchdog_force_polling: true
+
+logging:
+  level: "DEBUG"          # DEBUG, INFO, WARNING, ERROR
+  file: "/mnt/e/programacao_novo/python/Laudos_Matao/watchdog_dicom_upload/logs/uploader.log"
+  enable_pynetdicom_debug: false
