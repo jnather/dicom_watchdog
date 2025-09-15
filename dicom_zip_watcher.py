@@ -3,20 +3,17 @@
 
 """
 dicom_zip_watcher.py
-Continuously monitors a folder for new ZIP files, extracts them, detects DICOM files
-(regardless of extension), and uploads them to a remote DICOM server using C-STORE.
+Monitora uma pasta por novos ZIPs, extrai, detecta DICOMs e envia via C-STORE.
 
-Dependencies:
+Dependências:
   pip install pydicom pynetdicom pyyaml
-
-Optional (nice to have for robust filesystem notifications):
+Recomendado para melhor notificação de FS:
   pip install watchdog
-If watchdog is not available, the script falls back to a polling loop.
 
 Config:
-  Provide a YAML config file (example at the end of this script).
+  Forneça um YAML (exemplo no final, se desejar).
 
-Author: (you)
+Autor: (you)
 """
 
 import os
@@ -189,7 +186,6 @@ def is_dicom(path: Path) -> bool:
         return True
     try:
         _ = pydicom.dcmread(str(path), stop_before_pixels=True, force=True, specific_tags=[])
-        # If it parsed a dataset and has some standard attributes or file_meta, we consider it DICOM
         return True
     except (InvalidDicomError, Exception):
         return False
@@ -227,7 +223,7 @@ def extract_zip(zip_path: Path, dest_dir: Path) -> Path:
         for info in infos:
             rel = Path(info.filename.replace("\\", "/"))
 
-            # Directory entries (ZIP uses trailing '/'; some tools may omit — we'll create parents anyway)
+            # Directory entries
             if str(rel).endswith("/"):
                 out_dir = (base_resolved / rel).resolve()
                 if not str(out_dir).startswith(str(base_resolved)):
@@ -286,6 +282,23 @@ def walk_files(root: Path) -> Iterable[Path]:
 # =========================
 
 class DicomSender:
+    # Transfer Syntax UIDs
+    IMPL_VR_LE = UID("1.2.840.10008.1.2")
+    EXPL_VR_LE = UID("1.2.840.10008.1.2.1")
+    EXPL_VR_BE = UID("1.2.840.10008.1.2.2")
+    RLE_LOSSLESS = UID("1.2.840.10008.1.2.5")
+    JPEG_BASELINE = UID("1.2.840.10008.1.2.4.50")
+    JPEG_EXTENDED = UID("1.2.840.10008.1.2.4.51")
+    JPEG_LOSSLESS_14 = UID("1.2.840.10008.1.2.4.57")
+    JPEG_LOSSLESS_14_S1 = UID("1.2.840.10008.1.2.4.70")
+    JPEG2000_LOSSLESS = UID("1.2.840.10008.1.2.4.90")
+    JPEG2000 = UID("1.2.840.10008.1.2.4.91")
+
+    COMPRESSED_TS = {
+        RLE_LOSSLESS, JPEG_BASELINE, JPEG_EXTENDED, JPEG_LOSSLESS_14,
+        JPEG_LOSSLESS_14_S1, JPEG2000_LOSSLESS, JPEG2000
+    }
+
     def __init__(self, config: dict):
         self.config = config
         self.ae: Optional[AE] = None
@@ -301,43 +314,172 @@ class DicomSender:
         self.peer_port = int(self.config["dicom"]["peer_port"])
         self.peer_ae_title = self.config["dicom"].get("peer_ae_title", "ANY-SCP")
 
-        # TLS (optional; not configured here, hook available)
+        # Behavior
+        behavior = self.config.get("behavior", {})
+        self.transcode_to_accepted = bool(behavior.get("transcode_to_accepted", True))
+        self.prefer_uncompressed = behavior.get("prefer_uncompressed_ts", "explicit").lower()  # 'explicit'|'implicit'
+
+        # TLS (opcional; não configurado aqui)
         self.use_tls = bool(self.config["dicom"].get("use_tls", False))
 
-        # Debug logging for pynetdicom (optional)
-        if bool(self.config["logging"].get("enable_pynetdicom_debug", False)):
+        # Debug logging para pynetdicom (opcional)
+        if bool(self.config.get("logging", {}).get("enable_pynetdicom_debug", False)):
             debug_logger()
+
+        self._contexts_logged = False  # evita log duplicado
 
     def _build_ae(self) -> AE:
         ae = AE(ae_title=self.local_ae_title)
-        # Set port and PDU size after creation
+        # Port/PDU
         if self.local_port:
+            # Observação: 'local_socket' é experimental; se tiver problema, remova.
             ae.local_socket = (None, self.local_port)
         if self.max_pdu:
             ae.maximum_pdu = self.max_pdu
-        
-        # Add only essential storage presentation contexts to avoid hitting limits
-        # Add Verification SOP Class first (for C-ECHO ping)
+
+        # C-ECHO
         ae.add_requested_context(UID("1.2.840.10008.1.1"))
-        
-        # Add common DICOM storage SOP classes (limit to most common ones)
+
+        # SOP classes comuns
         common_sop_classes = [
-            "1.2.840.10008.5.1.4.1.1.1",   # Computed Radiography Image Storage
-            "1.2.840.10008.5.1.4.1.1.2",   # CT Image Storage
-            "1.2.840.10008.5.1.4.1.1.4",   # MR Image Storage
-            "1.2.840.10008.5.1.4.1.1.6.1", # Ultrasound Image Storage
-            "1.2.840.10008.5.1.4.1.1.7",   # Secondary Capture Image Storage
-            "1.2.840.10008.5.1.4.1.1.12.1", # X-Ray Angiographic Image Storage
-            "1.2.840.10008.5.1.4.1.1.12.2", # X-Ray Radiofluoroscopic Image Storage
+            "1.2.840.10008.5.1.4.1.1.1",     # CR
+            "1.2.840.10008.5.1.4.1.1.2",     # CT
+            "1.2.840.10008.5.1.4.1.1.4",     # MR
+            "1.2.840.10008.5.1.4.1.1.4.1",   # Enhanced MR
+            "1.2.840.10008.5.1.4.1.1.4.3",   # MR Spectroscopy
+            "1.2.840.10008.5.1.4.1.1.6.1",   # US
+            "1.2.840.10008.5.1.4.1.1.7",     # Secondary Capture
+            "1.2.840.10008.5.1.4.1.1.12.1",  # XA
+            "1.2.840.10008.5.1.4.1.1.12.2",  # RF
+            "1.2.840.10008.5.1.4.1.1.128",   # PET
+            "1.2.840.10008.5.1.4.1.1.20",    # NM
         ]
-        
-        for sop_class in common_sop_classes:
+
+        # Transfer syntaxes apresentadas (propomos várias; o SCP aceitará subset)
+        transfer_syntaxes = [
+            self.EXPL_VR_LE,
+            self.IMPL_VR_LE,
+            self.EXPL_VR_BE,
+            self.RLE_LOSSLESS,
+            self.JPEG_BASELINE,
+            self.JPEG_EXTENDED,
+            self.JPEG_LOSSLESS_14,
+            self.JPEG_LOSSLESS_14_S1,
+            self.JPEG2000_LOSSLESS,
+            self.JPEG2000,
+        ]
+        # Adiciona contexts
+        for sop in common_sop_classes:
             try:
-                ae.add_requested_context(UID(sop_class))
+                ae.add_requested_context(UID(sop), transfer_syntaxes)
             except Exception as e:
-                logging.warning(f"Failed to add SOP class {sop_class}: {e}")
-        
+                logging.warning(f"Failed to add SOP class {sop}: {e}")
+
         return ae
+
+    def _log_accepted_contexts_once(self) -> None:
+        if self._contexts_logged or not self.assoc:
+            return
+        self._contexts_logged = True
+        lines = ["Accepted Presentation Contexts:"]
+        for cx in self.assoc.accepted_contexts:
+            try:
+                ts_list = ", ".join(str(ts) for ts in cx.transfer_syntax)
+            except Exception:
+                ts_list = str(cx.transfer_syntax)
+            lines.append(f"  - {cx.abstract_syntax.name} [{cx.abstract_syntax}]: {ts_list}")
+        logging.info("\n".join(lines))
+
+    def _accepted_ts_for_sop(self, sop_class_uid: UID) -> List[UID]:
+        if not self.assoc:
+            return []
+        out = []
+        for cx in self.assoc.accepted_contexts:
+            if str(cx.abstract_syntax) == str(sop_class_uid):
+                # cx.transfer_syntax pode ser único ou lista
+                ts_vals = cx.transfer_syntax if isinstance(cx.transfer_syntax, (list, tuple)) else [cx.transfer_syntax]
+                out.extend([UID(str(ts)) for ts in ts_vals])
+        return out
+
+    def _choose_uncompressed_ts(self, accepted_ts: List[UID]) -> Optional[UID]:
+        # Preferência configurável
+        if self.EXPL_VR_LE in accepted_ts and self.prefer_uncompressed == "explicit":
+            return self.EXPL_VR_LE
+        if self.IMPL_VR_LE in accepted_ts:
+            return self.IMPL_VR_LE
+        if self.EXPL_VR_LE in accepted_ts:
+            return self.EXPL_VR_LE
+        return None
+
+    def _is_compressed_ts(self, ts: UID) -> bool:
+        return ts in self.COMPRESSED_TS
+
+    def _try_decompress(self, ds: Dataset) -> bool:
+        try:
+            # Tenta descompressão (RLE/JPEG/etc). Requer handlers instalados.
+            ds.decompress()
+            return True
+        except Exception as e:
+            logging.error(
+                "Falha ao descomprimir Pixel Data. "
+                "Instale handlers: 'pip install numpy pylibjpeg pylibjpeg-libjpeg pylibjpeg-openjpeg pylibjpeg-rle gdcm'. "
+                f"Erro: {e}"
+            )
+            return False
+
+    def _reencode_to_accepted_if_needed(self, ds: Dataset) -> Tuple[Optional[Dataset], Optional[str]]:
+        """Garante que o dataset use uma transfer syntax aceita pelo peer.
+        Retorna (ds_possivelmente_modificado, motivo_info_ou_None). Se não for possível, retorna (None, motivo)."""
+        sop = getattr(ds, "SOPClassUID", None) or getattr(getattr(ds, "file_meta", None), "MediaStorageSOPClassUID", None)
+        if not sop:
+            return None, "Dataset sem SOPClassUID"
+
+        accepted_ts = self._accepted_ts_for_sop(UID(str(sop)))
+        if not accepted_ts:
+            return None, f"Nenhum presentation context aceito para SOP {sop}"
+
+        current_ts = getattr(getattr(ds, "file_meta", None), "TransferSyntaxUID", None)
+        if not current_ts:
+            # Assume implicit LE se ausente (caso raro)
+            current_ts = self.IMPL_VR_LE
+
+        current_ts = UID(str(current_ts))
+        if current_ts in accepted_ts:
+            return ds, None  # já aceito
+
+        # Tenta escolher um TS descompactado aceito
+        fallback_ts = self._choose_uncompressed_ts(accepted_ts)
+        if not fallback_ts:
+            return None, (
+                f"O peer não aceitou nenhuma Transfer Syntax descompactada para SOP {sop}. "
+                f"Aceitas: {[str(ts) for ts in accepted_ts]}; atual: {current_ts}"
+            )
+
+        # Se atual for comprimido, precisamos descomprimir
+        if self._is_compressed_ts(current_ts):
+            ok = self._try_decompress(ds)
+            if not ok:
+                return None, f"Não foi possível descomprimir {current_ts} -> {fallback_ts}"
+
+        # Ajusta metadados de TS e flags de endianness/VR
+        if not hasattr(ds, "file_meta"):
+            ds.file_meta = pydicom.dataset.FileMetaDataset()
+        ds.file_meta.TransferSyntaxUID = fallback_ts
+
+        if fallback_ts == self.EXPL_VR_LE:
+            ds.is_little_endian = True
+            ds.is_implicit_VR = False
+        elif fallback_ts == self.IMPL_VR_LE:
+            ds.is_little_endian = True
+            ds.is_implicit_VR = True
+        elif fallback_ts == self.EXPL_VR_BE:
+            ds.is_little_endian = False
+            ds.is_implicit_VR = False
+        else:
+            # Outros TS não compactados não são esperados aqui
+            pass
+
+        return ds, f"Re-encodado de {current_ts} para {fallback_ts}"
 
     def c_echo(self) -> bool:
         self._ensure_association()
@@ -358,6 +500,7 @@ class DicomSender:
         self.assoc = self.ae.associate(self.peer_host, self.peer_port, ae_title=self.peer_ae_title)
         if not self.assoc.is_established:
             raise RuntimeError(f"Association to {self.peer_host}:{self.peer_port} failed")
+        self._log_accepted_contexts_once()
 
     def _teardown(self) -> None:
         try:
@@ -371,24 +514,45 @@ class DicomSender:
                 except Exception:
                     pass
             self.ae = None
+        self._contexts_logged = False
+
+    def _send_single(self, ds: Dataset, src_path: Path) -> bool:
+        """Envio de um único dataset com possível re-encode para TS aceita."""
+        # Garante associação
+        self._ensure_association()
+
+        # Tenta re-encode se necessário
+        if self.transcode_to_accepted:
+            ds2, reason = self._reencode_to_accepted_if_needed(ds)
+            if ds2 is None:
+                logging.error(f"Não é possível enviar {src_path.name}: {reason}")
+                return False
+            if reason:
+                logging.info(f"{src_path.name}: {reason}")
+            ds = ds2
+
+        status = self.assoc.send_c_store(ds)
+        if status and status.Status in (0x0000, 0xB000):
+            logging.info(f"C-STORE OK: {src_path.name} (Status=0x{status.Status:04X})")
+            return True
+        else:
+            st = getattr(status, "Status", None)
+            logging.error(f"C-STORE FAILED: {src_path.name} (Status={st})")
+            return False
 
     def send_files(self, files: List[Path], batch_size: int = 128) -> Tuple[int, int]:
-        """
-        Sends files via C-STORE. Returns (sent_ok, sent_failed).
-        """
+        """Envio simples (sem dedup). Retorna (ok, fail)."""
         sent_ok = 0
         sent_failed = 0
 
         def send_batch(batch: List[Path]) -> Tuple[int, int]:
             ok, fail = 0, 0
-            # Ensure association for each batch (reassociate if needed)
             self._ensure_association()
             for f in batch:
                 try:
                     ds = pydicom.dcmread(str(f), force=True)
-                    # Basic sanity: need SOP Class/Instance
+                    # Sanidade: precisa SOPClass/Instance
                     if not hasattr(ds, "SOPClassUID") or not hasattr(ds, "SOPInstanceUID"):
-                        # Some files might be Part10-less; attempt to set from File Meta if present
                         if hasattr(ds, "file_meta"):
                             ds.SOPClassUID = getattr(ds.file_meta, "MediaStorageSOPClassUID", None)
                             ds.SOPInstanceUID = getattr(ds.file_meta, "MediaStorageSOPInstanceUID", None)
@@ -397,20 +561,14 @@ class DicomSender:
                         fail += 1
                         continue
 
-                    status = self.assoc.send_c_store(ds)
-                    if status and status.Status in (0x0000, 0xB000):  # success or Coercion of Data Elements
+                    if self._send_single(ds, f):
                         ok += 1
-                        logging.info(f"C-STORE OK: {f.name} (Status=0x{status.Status:04X})")
                     else:
                         fail += 1
-                        st = getattr(status, "Status", None)
-                        logging.error(f"C-STORE FAILED: {f.name} (Status={st})")
                 except Exception as e:
                     fail += 1
                     logging.exception(f"Exception sending {f}: {e}")
             return ok, fail
-
-            # (Note: association teardown will happen in finally after all batches)
 
         try:
             for i in range(0, len(files), batch_size):
@@ -426,11 +584,7 @@ class DicomSender:
     def send_files_with_dedup(self, files: List[Path], db_path: Path, zip_sha256: str,
                               batch_size: int = 128, dedup_policy: str = "uid_then_sha256") -> Tuple[int, int]:
         """
-        Sends files via C-STORE with per-image dedup. Returns (sent_ok, sent_failed).
-        Dedup policy:
-          - uid_then_sha256: skip if SOPInstanceUID already uploaded; else if file_sha256 uploaded
-          - sha256_only: use only file_sha256
-          - uid_only: use only SOPInstanceUID
+        Envio com deduplicação por imagem. Retorna (ok, fail).
         """
         sent_ok, sent_failed = 0, 0
 
@@ -452,7 +606,6 @@ class DicomSender:
                 try:
                     ds = pydicom.dcmread(str(fpath), force=True)
                     sop_uid = getattr(ds, "SOPInstanceUID", None)
-                    # If SOPInstanceUID absent, attempt from file_meta
                     if not sop_uid and hasattr(ds, "file_meta"):
                         sop_uid = getattr(ds.file_meta, "MediaStorageSOPInstanceUID", None)
 
@@ -460,7 +613,7 @@ class DicomSender:
                         logging.info(f"SKIP (already uploaded): {fpath.name} (UID={sop_uid} SHA={fsha[:12]})")
                         continue
 
-                    # Must have a SOP Class/Instance to send; try to fix from file_meta
+                    # Sanidade
                     if not hasattr(ds, "SOPClassUID") and hasattr(ds, "file_meta"):
                         ds.SOPClassUID = getattr(ds.file_meta, "MediaStorageSOPClassUID", None)
 
@@ -470,23 +623,20 @@ class DicomSender:
                         sent_failed += 1
                         continue
 
-                    status = self.assoc.send_c_store(ds)
-                    ok = bool(status and status.Status in (0x0000, 0xB000))
-                    if ok:
-                        logging.info(f"C-STORE OK: {fpath.name} (UID={ds.SOPInstanceUID})")
-                        sent_ok += 1
-                    else:
-                        logging.error(f"C-STORE FAILED: {fpath.name} (Status={getattr(status, 'Status', None)})")
-                        sent_failed += 1
-
+                    ok = self._send_single(ds, fpath)
                     mark_object_uploaded(db_path, sop_uid or getattr(ds, "SOPInstanceUID", None),
                                          fsha, zip_sha256, str(fpath), ok=ok)
+                    if ok:
+                        sent_ok += 1
+                    else:
+                        sent_failed += 1
+
                 except Exception as e:
                     logging.exception(f"Exception sending {fpath}: {e}")
                     mark_object_uploaded(db_path, sop_uid, fsha, zip_sha256, str(fpath), ok=False)
                     sent_failed += 1
 
-        # Precompute SHA256 once per file, build batches
+        # Precompute SHA256
         pairs = [(p, sha256_of_path(p)) for p in files]
 
         try:
@@ -526,7 +676,7 @@ class ZipProcessor:
     def process_zip(self, zip_path: Path) -> None:
         logging.info(f"Processing ZIP: {zip_path}")
 
-        # Confirm the file is fully written (size stable for a few seconds)
+        # Aguarda estabilizar tamanho (arquivo totalmente gravado)
         prev_size = -1
         for _ in range(self.wait_zip_complete_seconds):
             size = zip_path.stat().st_size
@@ -535,7 +685,7 @@ class ZipProcessor:
             prev_size = size
             time.sleep(1)
 
-        # Dedup based on SHA256 of the zip content
+        # Dedup por SHA256 do ZIP
         zhash = sha256_file(zip_path)
         if is_zip_processed(self.db_path, zhash):
             logging.info(f"Zip already processed (hash ledger): {zip_path.name}")
@@ -543,12 +693,11 @@ class ZipProcessor:
                 self._archive_zip(zip_path)
             return
 
-        # Extract
+        # Extrai
         try:
             extract_root = extract_zip(zip_path, self.work_dir)
         except zipfile.BadZipFile:
             logging.error(f"Bad ZIP file, moving to archive (bad): {zip_path}")
-            # Move away so we don't loop forever
             bad_dir = self.archive_dir / "bad"
             safe_mkdir(bad_dir)
             try:
@@ -566,7 +715,7 @@ class ZipProcessor:
                 pass
             return
 
-        # Discover DICOMs
+        # Detecta DICOMs
         dicom_files: List[Path] = []
         total_files = 0
         for f in walk_files(extract_root):
@@ -575,19 +724,18 @@ class ZipProcessor:
                 if is_dicom(f):
                     dicom_files.append(f)
             except Exception:
-                # Non-fatal, just skip weird files
                 pass
 
         logging.info(f"Extracted {total_files} files; detected {len(dicom_files)} DICOM files")
 
         if dicom_files:
-            # Optional ping
+            # C-ECHO opcional
             try:
                 self.sender.c_echo()
             except Exception as e:
                 logging.warning(f"C-ECHO failed (will attempt C-STORE anyway): {e}")
 
-            # Use deduplication-aware sending
+            # Envia com dedup
             dedup_policy = self.config["behavior"].get("dedup_policy", "uid_then_sha256")
             ok, fail = self.sender.send_files_with_dedup(
                 dicom_files, self.db_path, zhash, self.send_batch_size, dedup_policy
@@ -612,7 +760,6 @@ class ZipProcessor:
         dest = self.archive_dir / zip_path.name
         try:
             if dest.exists():
-                # Avoid overwrite
                 dest = self.archive_dir / f"{zip_path.stem}__{int(time.time())}.zip"
             shutil.move(str(zip_path), str(dest))
             logging.info(f"Moved ZIP to archive: {dest}")
@@ -626,7 +773,6 @@ class ZipProcessor:
         while True:
             try:
                 for p in self.watch_dir.glob("*.zip"):
-                    # Safe to call every cycle: process_zip handles hash-dedup and moves away on success
                     self.process_zip(p)
                 time.sleep(self.poll_interval)
             except KeyboardInterrupt:
@@ -653,7 +799,7 @@ class ZipProcessor:
                 if (not event.is_directory) and event.src_path.lower().endswith(".zip"):
                     self.outer.process_zip(Path(event.src_path))
 
-        # Process existing ZIP files first
+        # Processa ZIPs já existentes
         logging.info(f"Processing existing ZIP files in {self.watch_dir}")
         existing_zips = list(self.watch_dir.glob("*.zip"))
         if existing_zips:
@@ -664,13 +810,12 @@ class ZipProcessor:
             logging.info("No existing ZIP files found")
 
         event_handler = ZipHandler(self)
-        
-        # Choose backend: PollingObserver is rock-solid everywhere
+
         force_poll = bool(self.config["behavior"].get("watchdog_force_polling", False))
         observer = (PollingObserver if force_poll else Observer)()
         observer.schedule(event_handler, str(self.watch_dir), recursive=False)
         observer.start()
-        
+
         mode = "polling watchdog" if force_poll else "watchdog"
         logging.info(f"Watching ({mode}) {self.watch_dir} for new ZIPs")
 
